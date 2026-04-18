@@ -1,216 +1,240 @@
 """
-gui.py - Pygame-based GUI for the Bocce simulation.
+gui.py - Matplotlib-based GUI for the Bocce simulation.
 
 Displays:
-  - The bocce field (4 m × 1.5 m scaled to window)
+  - The bocce field (4 m × 1.5 m)
   - Coloured circles for each boccia
-  - The pallino (white dot at centre)
+  - The pallino (orange dot at centre)
   - Distance lines and labels
-  - Ranking panel (closest → furthest)
-  - RSSI information per boccia
-  - On-screen instructions
+  - Stats panel (right) with ranking and RSSI
 
 Controls:
-  SPACE  – Launch bocce
+  Click  – Launch bocce (when not in motion)
   R      – Restart game
-  ESC/Q  – Quit
+  Q      – Quit
 """
 
 import sys
-import math
-import pygame
+import logging
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.animation import FuncAnimation
 
 from simulator.boccia import FIELD_WIDTH, FIELD_HEIGHT, BOCCIA_RADIUS
 from simulator.master import PALLINO_X, PALLINO_Y
 
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
-# Layout constants
+# Colour palette (Matplotlib-compatible hex strings)
+# Same ordering as game_engine.BOCCIA_COLORS
 # ---------------------------------------------------------------------------
-WINDOW_W = 1100
-WINDOW_H = 700
-
-FIELD_MARGIN_X = 40
-FIELD_MARGIN_Y = 80
-FIELD_DISPLAY_W = 700
-FIELD_DISPLAY_H = int(FIELD_DISPLAY_W * (FIELD_HEIGHT / FIELD_WIDTH))
-
-PANEL_X = FIELD_MARGIN_X + FIELD_DISPLAY_W + 20
-PANEL_Y = FIELD_MARGIN_Y
-PANEL_W = WINDOW_W - PANEL_X - 10
-PANEL_H = FIELD_DISPLAY_H
-
-# Colours
-C_BG = (30, 30, 30)
-C_FIELD = (34, 85, 34)          # grass green
-C_FIELD_BORDER = (180, 140, 80) # sand/clay border
-C_PALLINO = (255, 255, 255)
-C_PALLINO_OUTLINE = (200, 200, 0)
-C_TEXT = (230, 230, 230)
-C_TEXT_DIM = (140, 140, 140)
-C_WINNER_GLOW = (255, 215, 0)   # gold
-C_PANEL_BG = (45, 45, 55)
-C_PANEL_BORDER = (80, 80, 100)
-C_DISTANCE_LINE = (200, 200, 200, 80)
-C_HEADER = (100, 180, 255)
-
-
-def _scale_pos(mx: float, my: float) -> tuple:
-    """Convert field metres to pixel coordinates."""
-    px = FIELD_MARGIN_X + int(mx / FIELD_WIDTH * FIELD_DISPLAY_W)
-    py = FIELD_MARGIN_Y + int(my / FIELD_HEIGHT * FIELD_DISPLAY_H)
-    return (px, py)
-
-
-def _scale_radius(r_m: float) -> int:
-    """Convert a radius in metres to pixels."""
-    return max(4, int(r_m / FIELD_WIDTH * FIELD_DISPLAY_W))
+BOCCIA_COLORS_MPL = [
+    "#DC3232",  # red
+    "#3264DC",  # blue
+    "#32B432",  # green
+    "#DCB432",  # yellow/gold
+    "#A032B4",  # purple
+    "#32BEBE",  # cyan
+    "#DC6E32",  # orange
+    "#B43274",  # pink/rose
+]
 
 
 class BocceGUI:
     """
-    Main Pygame GUI class.
+    Matplotlib-based GUI for the Bocce simulation.
 
     Parameters
     ----------
     engine : GameEngine
         Running game engine instance.
     fps : int
-        Target frame rate.
+        Target frames per second.
     """
 
     def __init__(self, engine, fps: int = 60):
         self.engine = engine
         self.fps = fps
-
-        pygame.init()
-        pygame.display.set_caption("Bocce Simulation – BLE/RSSI")
-        self.screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
-        self.clock = pygame.time.Clock()
-
-        # Font sizes
-        self.font_lg = pygame.font.SysFont("DejaVuSans", 18, bold=True)
-        self.font_md = pygame.font.SysFont("DejaVuSans", 15)
-        self.font_sm = pygame.font.SysFont("DejaVuSans", 12)
-
         self._last_packet: dict = {}
         self._running = True
 
+        # Figure: two axes side-by-side (70 % field | 30 % stats)
+        self.fig = plt.figure("Bocce BLE/RSSI Simulation", figsize=(14, 6))
+        self.fig.patch.set_facecolor("#1e1e1e")
+
+        self.ax_field = self.fig.add_axes([0.03, 0.12, 0.63, 0.78])
+        self.ax_stats = self.fig.add_axes([0.70, 0.12, 0.28, 0.78])
+
+        self._setup_field_axes()
+        self._setup_stats_axes()
+
+        # Event connections
+        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
+
+        # Animation – interval in ms
+        interval_ms = max(1, int(1000 / fps))
+        self._anim = FuncAnimation(
+            self.fig,
+            self._update,
+            interval=interval_ms,
+            blit=False,
+            cache_frame_data=False,
+        )
+
     # ------------------------------------------------------------------
-    # Main loop
+    # Axes setup helpers
+    # ------------------------------------------------------------------
+
+    def _setup_field_axes(self) -> None:
+        """Configure the bocce field axes."""
+        ax = self.ax_field
+        ax.set_facecolor("#1a5c1a")
+        ax.set_xlim(-0.1, FIELD_WIDTH + 0.1)
+        ax.set_ylim(-0.1, FIELD_HEIGHT + 0.1)
+        ax.set_aspect("equal")
+        ax.set_xlabel("m", color="#aaaaaa")
+        ax.set_ylabel("m", color="#aaaaaa")
+        ax.tick_params(colors="#aaaaaa")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#b48c50")
+            spine.set_linewidth(3)
+        ax.grid(True, color="#2a7a2a", linewidth=0.5, alpha=0.7)
+        ax.set_title(
+            "Campo Bocce", color="#64b4ff", fontsize=13, fontweight="bold", pad=6
+        )
+
+    def _setup_stats_axes(self) -> None:
+        """Configure the stats panel axes."""
+        ax = self.ax_stats
+        ax.set_facecolor("#2d2d37")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+        ax.set_title(
+            "📡 Bocce Status", color="#64b4ff", fontsize=12, fontweight="bold", pad=6
+        )
+
+    # ------------------------------------------------------------------
+    # Public entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Start the GUI event loop (blocking)."""
-        while self._running:
-            self._handle_events()
-            self._last_packet = self.engine.update()
-            self._draw()
-            self.clock.tick(self.fps)
-
-        pygame.quit()
-        sys.exit(0)
+        """Start the GUI event loop (blocking via plt.show)."""
+        plt.show()
 
     # ------------------------------------------------------------------
-    # Event handling
+    # Animation callback
     # ------------------------------------------------------------------
 
-    def _handle_events(self) -> None:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self._running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    self._running = False
-                elif event.key == pygame.K_SPACE:
-                    if not self.engine.game_started or self.engine.all_stopped:
-                        self.engine.launch_bocce()
-                elif event.key == pygame.K_r:
-                    self.engine.reset()
+    def _update(self, frame) -> None:
+        """FuncAnimation callback: advance simulation and redraw."""
+        if not self._running:
+            return
 
-    # ------------------------------------------------------------------
-    # Drawing
-    # ------------------------------------------------------------------
+        self._last_packet = self.engine.update()
+        self._redraw_field()
+        self._redraw_stats()
 
-    def _draw(self) -> None:
-        self.screen.fill(C_BG)
-        self._draw_field()
-        self._draw_bocce()
-        self._draw_pallino()
-        self._draw_distance_lines()
-        self._draw_panel()
-        self._draw_instructions()
-        pygame.display.flip()
-
-    def _draw_field(self) -> None:
-        """Draw the bocce field rectangle."""
-        field_rect = pygame.Rect(
-            FIELD_MARGIN_X, FIELD_MARGIN_Y, FIELD_DISPLAY_W, FIELD_DISPLAY_H
+        state = self.engine.raspberry_pi.game_state
+        self.fig.suptitle(
+            f"Bocce BLE/RSSI Simulation – ESP32-C3 + Raspberry Pi  |  {state.upper()}",
+            color="#64b4ff",
+            fontsize=11,
+            fontweight="bold",
+            y=0.98,
         )
-        pygame.draw.rect(self.screen, C_FIELD, field_rect)
-        pygame.draw.rect(self.screen, C_FIELD_BORDER, field_rect, 4)
 
-        # Grid lines every 1 m
-        for gx in range(1, int(FIELD_WIDTH)):
-            px = FIELD_MARGIN_X + int(gx / FIELD_WIDTH * FIELD_DISPLAY_W)
-            pygame.draw.line(
-                self.screen,
-                (50, 110, 50),
-                (px, FIELD_MARGIN_Y),
-                (px, FIELD_MARGIN_Y + FIELD_DISPLAY_H),
-                1,
+    # ------------------------------------------------------------------
+    # Drawing – field
+    # ------------------------------------------------------------------
+
+    def _redraw_field(self) -> None:
+        """Clear and redraw the bocce field subplot."""
+        ax = self.ax_field
+        ax.cla()
+        self._setup_field_axes()
+
+        # Field border rectangle
+        ax.add_patch(
+            patches.Rectangle(
+                (0, 0),
+                FIELD_WIDTH,
+                FIELD_HEIGHT,
+                linewidth=3,
+                edgecolor="#b48c50",
+                facecolor="none",
             )
-        for gy_cm in range(50, int(FIELD_HEIGHT * 100), 50):
-            py = FIELD_MARGIN_Y + int((gy_cm / 100) / FIELD_HEIGHT * FIELD_DISPLAY_H)
-            pygame.draw.line(
-                self.screen,
-                (50, 110, 50),
-                (FIELD_MARGIN_X, py),
-                (FIELD_MARGIN_X + FIELD_DISPLAY_W, py),
-                1,
-            )
+        )
 
-        # Axis labels
-        for m in range(int(FIELD_WIDTH) + 1):
-            px = FIELD_MARGIN_X + int(m / FIELD_WIDTH * FIELD_DISPLAY_W)
-            lbl = self.font_sm.render(f"{m}m", True, C_TEXT_DIM)
-            self.screen.blit(lbl, (px - 8, FIELD_MARGIN_Y + FIELD_DISPLAY_H + 4))
+        # Pallino
+        ax.add_patch(
+            patches.Circle((PALLINO_X, PALLINO_Y), 0.04, color="#ffa500", zorder=5)
+        )
+        ax.text(
+            PALLINO_X,
+            PALLINO_Y + 0.07,
+            "P",
+            ha="center",
+            va="bottom",
+            color="white",
+            fontsize=8,
+            fontweight="bold",
+            zorder=6,
+        )
 
-    def _draw_bocce(self) -> None:
-        """Draw each boccia as a filled circle with ID label."""
-        r_px = _scale_radius(BOCCIA_RADIUS)
+        bocce_data = self._last_packet.get("bocce", [])
         winner_id = self._last_packet.get("winner_id")
 
         for boccia in self.engine.bocce:
-            px, py = _scale_pos(boccia.x, boccia.y)
+            color = self._boccia_mpl_color(boccia)
+
+            # Dashed distance line to pallino
+            ax.plot(
+                [boccia.x, PALLINO_X],
+                [boccia.y, PALLINO_Y],
+                color=color,
+                alpha=0.4,
+                linewidth=0.8,
+                linestyle="--",
+                zorder=2,
+            )
 
             # Winner glow ring
             if boccia.player_id == winner_id and self.engine.all_stopped:
-                pygame.draw.circle(self.screen, C_WINNER_GLOW, (px, py), r_px + 5, 3)
+                ax.add_patch(
+                    patches.Circle(
+                        (boccia.x, boccia.y),
+                        BOCCIA_RADIUS + 0.015,
+                        color="#ffd700",
+                        linewidth=2,
+                        fill=False,
+                        zorder=3,
+                    )
+                )
 
-            # Shadow
-            pygame.draw.circle(self.screen, (0, 0, 0, 100), (px + 2, py + 2), r_px)
-            # Fill
-            pygame.draw.circle(self.screen, boccia.color, (px, py), r_px)
-            # Outline
-            pygame.draw.circle(self.screen, (255, 255, 255), (px, py), r_px, 1)
+            # Boccia circle
+            ax.add_patch(
+                patches.Circle((boccia.x, boccia.y), BOCCIA_RADIUS, color=color, zorder=4)
+            )
 
-            # ID number
-            lbl = self.font_sm.render(str(boccia.player_id + 1), True, (255, 255, 255))
-            self.screen.blit(lbl, (px - 4, py - 6))
+            # ID label
+            ax.text(
+                boccia.x,
+                boccia.y,
+                str(boccia.player_id + 1),
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=7,
+                fontweight="bold",
+                zorder=5,
+            )
 
-    def _draw_pallino(self) -> None:
-        """Draw the pallino (jack) at its fixed position."""
-        px, py = _scale_pos(PALLINO_X, PALLINO_Y)
-        pygame.draw.circle(self.screen, C_PALLINO_OUTLINE, (px, py), 9)
-        pygame.draw.circle(self.screen, C_PALLINO, (px, py), 7)
-        lbl = self.font_sm.render("P", True, (0, 0, 0))
-        self.screen.blit(lbl, (px - 4, py - 6))
-
-    def _draw_distance_lines(self) -> None:
-        """Draw lines from each boccia to the pallino with distance label."""
-        pallino_px, pallino_py = _scale_pos(PALLINO_X, PALLINO_Y)
-        bocce_data = self._last_packet.get("bocce", [])
-
+        # Distance labels at midpoints
         for b in bocce_data:
             pid = b["player_id"]
             boccia_obj = next(
@@ -218,141 +242,146 @@ class BocceGUI:
             )
             if boccia_obj is None:
                 continue
-
-            bx, by = _scale_pos(boccia_obj.x, boccia_obj.y)
             dist = b["dist_to_pallino_true"]
+            mid_x = (boccia_obj.x + PALLINO_X) / 2
+            mid_y = (boccia_obj.y + PALLINO_Y) / 2
+            ax.text(
+                mid_x,
+                mid_y,
+                f"{dist:.2f}m",
+                ha="center",
+                va="center",
+                color="#aaaaaa",
+                fontsize=6,
+                zorder=6,
+            )
 
-            # Dashed-style line (draw alternating segments)
-            n_segs = 12
-            for seg in range(n_segs):
-                if seg % 2 == 0:
-                    t0 = seg / n_segs
-                    t1 = (seg + 1) / n_segs
-                    x0 = int(bx + (pallino_px - bx) * t0)
-                    y0 = int(by + (pallino_py - by) * t0)
-                    x1 = int(bx + (pallino_px - bx) * t1)
-                    y1 = int(by + (pallino_py - by) * t1)
-                    pygame.draw.line(
-                        self.screen, (*boccia_obj.color, 120), (x0, y0), (x1, y1), 1
-                    )
-
-            # Midpoint label
-            mid_x = (bx + pallino_px) // 2
-            mid_y = (by + pallino_py) // 2
-            lbl = self.font_sm.render(f"{dist:.2f}m", True, C_TEXT_DIM)
-            self.screen.blit(lbl, (mid_x + 2, mid_y - 8))
-
-    def _draw_panel(self) -> None:
-        """Draw the info panel on the right side."""
-        panel_rect = pygame.Rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H)
-        pygame.draw.rect(self.screen, C_PANEL_BG, panel_rect, border_radius=8)
-        pygame.draw.rect(self.screen, C_PANEL_BORDER, panel_rect, 2, border_radius=8)
-
-        y = PANEL_Y + 10
-        line_h = 20
-
-        # Header
-        hdr = self.font_lg.render("📡 Bocce Status", True, C_HEADER)
-        self.screen.blit(hdr, (PANEL_X + 10, y))
-        y += line_h + 6
-
-        # Game state
-        state = self.engine.raspberry_pi.game_state
-        rnd = self.engine.raspberry_pi.round
-        state_lbl = self.font_md.render(
-            f"State: {state.upper()}  Round: {rnd}", True, C_TEXT
+        # Instructions footer
+        self.fig.text(
+            0.03,
+            0.02,
+            "Click: launch bocce  |  R: restart  |  Q: quit",
+            color="#888888",
+            fontsize=8,
+            transform=self.fig.transFigure,
         )
-        self.screen.blit(state_lbl, (PANEL_X + 10, y))
-        y += line_h + 4
 
-        # Divider
-        pygame.draw.line(
-            self.screen,
-            C_PANEL_BORDER,
-            (PANEL_X + 10, y),
-            (PANEL_X + PANEL_W - 10, y),
-            1,
-        )
-        y += 8
+    # ------------------------------------------------------------------
+    # Drawing – stats panel
+    # ------------------------------------------------------------------
 
-        # Ranking header
-        rank_hdr = self.font_md.render("Ranking (closest first):", True, C_HEADER)
-        self.screen.blit(rank_hdr, (PANEL_X + 10, y))
-        y += line_h + 2
+    def _redraw_stats(self) -> None:
+        """Clear and redraw the stats panel subplot."""
+        ax = self.ax_stats
+        ax.cla()
+        self._setup_stats_axes()
 
         bocce_data = self._last_packet.get("bocce", [])
         winner_id = self._last_packet.get("winner_id")
+        state = self.engine.raspberry_pi.game_state
+        rnd = self.engine.raspberry_pi.round
+
+        y = 0.96
+        line_h = 0.055
+
+        def _txt(yy, s, color="#e6e6e6", size=9, bold=False):
+            ax.text(
+                0.05,
+                yy,
+                s,
+                color=color,
+                fontsize=size,
+                fontweight="bold" if bold else "normal",
+                transform=ax.transAxes,
+                va="top",
+            )
+
+        _txt(y, f"State: {state.upper()}", color="#64b4ff", bold=True)
+        y -= line_h
+        _txt(y, f"Round: {rnd}")
+        y -= line_h
+        _txt(y, f"Active bocce: {len(self.engine.bocce)}")
+        y -= line_h
+        _txt(y, f"Frame: {self.engine.frame}", color="#888888", size=8)
+        y -= line_h * 1.3
+        ax.axhline(y=y, color="#505064", linewidth=1, xmin=0.05, xmax=0.95)
+        y -= line_h * 0.6
+
+        _txt(y, "Ranking (closest first):", color="#64b4ff", bold=True)
+        y -= line_h
 
         for rank, b in enumerate(bocce_data):
             pid = b["player_id"]
             boccia_obj = next(
                 (bo for bo in self.engine.bocce if bo.player_id == pid), None
             )
-            color = boccia_obj.color if boccia_obj else C_TEXT
-
-            prefix = "🏆" if pid == winner_id else f"#{rank + 1}"
+            color = self._boccia_mpl_color(boccia_obj) if boccia_obj else "#e6e6e6"
+            is_winner = pid == winner_id and self.engine.all_stopped
+            prefix = "★" if is_winner else f"#{rank + 1}"
             dist = b["dist_to_pallino_true"]
             rssi = b["rssi_to_pallino"]
             moving = "●" if b["is_moving"] else "■"
-
-            text = f"{prefix} Boccia {pid + 1}  {dist:.3f}m  {rssi:.1f}dBm {moving}"
-            lbl = self.font_md.render(text, True, color)
-            self.screen.blit(lbl, (PANEL_X + 10, y))
-            y += line_h
-
-        # Divider
-        y += 4
-        pygame.draw.line(
-            self.screen,
-            C_PANEL_BORDER,
-            (PANEL_X + 10, y),
-            (PANEL_X + PANEL_W - 10, y),
-            1,
-        )
-        y += 8
-
-        # RSSI pairwise section
-        rssi_hdr = self.font_md.render("RSSI between bocce:", True, C_HEADER)
-        self.screen.blit(rssi_hdr, (PANEL_X + 10, y))
-        y += line_h + 2
-
-        for b in bocce_data:
-            pid = b["player_id"]
-            for other_id, rssi_val in b.get("rssi_to_others", {}).items():
-                if other_id > pid:   # show each pair once
-                    text = (
-                        f"  {pid + 1}↔{other_id + 1}: {rssi_val:.1f} dBm"
-                    )
-                    lbl = self.font_sm.render(text, True, C_TEXT_DIM)
-                    self.screen.blit(lbl, (PANEL_X + 10, y))
-                    y += 16
-                    if y > PANEL_Y + PANEL_H - 20:
-                        break
-            if y > PANEL_Y + PANEL_H - 20:
+            _txt(
+                y,
+                f"{prefix} B{pid + 1}  {dist:.3f}m  {rssi:.0f}dBm {moving}",
+                color=color,
+                size=8,
+            )
+            y -= line_h
+            if y < 0.08:
                 break
 
-    def _draw_instructions(self) -> None:
-        """Draw control instructions at the bottom of the screen."""
-        instructions = [
-            "SPACE: launch bocce",
-            "R: restart",
-            "ESC/Q: quit",
-        ]
-        y = FIELD_MARGIN_Y + FIELD_DISPLAY_H + 20
-        for i, txt in enumerate(instructions):
-            lbl = self.font_sm.render(txt, True, C_TEXT_DIM)
-            self.screen.blit(lbl, (FIELD_MARGIN_X + i * 220, y))
+        if y > 0.12:
+            ax.axhline(y=y, color="#505064", linewidth=1, xmin=0.05, xmax=0.95)
+            y -= line_h * 0.6
+            _txt(y, "RSSI between bocce:", color="#64b4ff", bold=True, size=8)
+            y -= line_h
 
-        # Frame counter
-        frame_lbl = self.font_sm.render(
-            f"Frame: {self.engine.frame}", True, C_TEXT_DIM
-        )
-        self.screen.blit(frame_lbl, (FIELD_MARGIN_X, y + 20))
+            for b in bocce_data:
+                pid = b["player_id"]
+                for other_id, rssi_val in b.get("rssi_to_others", {}).items():
+                    if other_id > pid:
+                        _txt(
+                            y,
+                            f"  {pid + 1}↔{other_id + 1}: {rssi_val:.0f} dBm",
+                            color="#888888",
+                            size=7,
+                        )
+                        y -= line_h * 0.9
+                        if y < 0.02:
+                            break
+                if y < 0.02:
+                    break
 
-        # Title
-        title = self.font_lg.render(
-            "Bocce BLE/RSSI Simulation – ESP32-C3 + Raspberry Pi",
-            True,
-            C_HEADER,
-        )
-        self.screen.blit(title, (FIELD_MARGIN_X, 10))
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _boccia_mpl_color(self, boccia) -> str:
+        """Return a Matplotlib hex color for the given boccia."""
+        if boccia is None:
+            return "#e6e6e6"
+        return BOCCIA_COLORS_MPL[boccia.player_id % len(BOCCIA_COLORS_MPL)]
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    def _on_key(self, event) -> None:
+        if event.key == "r":
+            self.engine.reset()
+            logger.info("Game reset via keyboard.")
+        elif event.key == "q" or event.key == "escape":
+            self._running = False
+            plt.close(self.fig)
+            sys.exit(0)
+
+    def _on_click(self, event) -> None:
+        if event.inaxes == self.ax_field:
+            if not self.engine.game_started or self.engine.all_stopped:
+                self.engine.launch_bocce()
+                logger.info("Bocce launched via click.")
+
+    def _on_close(self, event) -> None:
+        self._running = False
+        sys.exit(0)

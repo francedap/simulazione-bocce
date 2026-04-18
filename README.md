@@ -29,7 +29,7 @@ simulazione-bocce/
 │   └── game_engine.py     # Central simulation engine
 ├── visualization/
 │   ├── __init__.py
-│   └── gui.py             # Pygame-based GUI
+│   └── gui.py             # Matplotlib-based GUI
 ├── main.py                # Entry point (CLI)
 ├── requirements.txt       # Python dependencies
 └── README.md
@@ -77,9 +77,9 @@ python main.py --bocce 6 --fps 30 --debug
 
 | Key | Action |
 |-----|--------|
-| `SPACE` | Launch bocce (or re-launch when all stopped) |
+| `Click` (on field) | Launch bocce (or re-launch when all stopped) |
 | `R` | Restart game (new positions) |
-| `ESC` / `Q` | Quit |
+| `Q` | Quit |
 
 ---
 
